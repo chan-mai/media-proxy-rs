@@ -318,6 +318,12 @@ impl RequestContext {
 				}
 			}
 		}
+		// HEIC/PDF/VIPS/MNGはstatic/badgeも処理するため先頭で分岐
+		if self.codec.is_err() {
+			if let Some(resp) = self.encode_extra_format() {
+				return resp;
+			}
+		}
 		if self.parms.r#static.is_some() {
 			return self.encode_single();
 		}
@@ -707,6 +713,145 @@ impl RequestContext {
 		let frames = image::Frames::new(Box::new(collected.into_iter()));
 		self.encode_anim(frames, loop_count)
 	}
+	/// Content-Typeマーカーで分岐する追加対応形式(HEIC/PDF/VIPS/MNG)
+	/// 該当しなければNoneを返し通常経路へ
+	fn encode_extra_format(&mut self) -> Option<axum::response::Response> {
+		let content_type = self
+			.headers
+			.get("Content-Type")
+			.and_then(|v| std::str::from_utf8(v.as_bytes()).ok())?
+			.to_owned();
+		match content_type.as_str() {
+			"image/heic" | "image/heif" => Some(self.encode_heic()),
+			"application/pdf" => Some(self.encode_pdf()),
+			"image/x-vips" => Some(self.encode_vips()),
+			"image/x-mng" => Some(self.encode_mng()),
+			_ => None,
+		}
+	}
+	fn format_error_response(
+		&mut self,
+		msg: String,
+		fallback: &'static str,
+	) -> axum::response::Response {
+		self.headers
+			.append("X-Proxy-Error", error_header_value(msg, fallback));
+		(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+	}
+	fn encode_heic(&mut self) -> axum::response::Response {
+		// ピクセル確保前のヘッダのみによるゲート(finding #4)
+		let info = match heic_rs::probe(&self.src_bytes) {
+			Ok(info) => info,
+			Err(e) => {
+				return self.format_error_response(format!("Heic Error:{:?}", e), "HeicError")
+			}
+		};
+		// 回転・切り抜き前後どちらの寸法でも確保が入るため大きい方でゲート
+		let w = info.width.max(info.coded_width);
+		let h = info.height.max(info.coded_height);
+		if !self.dimensions_allowed(w as u64, h as u64) {
+			return self.decode_limit_response(format!("DecodeDimensions {}x{} over limit", w, h));
+		}
+		let options = heic_rs::DecodeOptions {
+			layout: heic_rs::PixelLayout::Rgba8,
+			max_pixels: Some(self.max_decode_pixels()),
+			..Default::default()
+		};
+		let decoded = match heic_rs::decode(&self.src_bytes, &options) {
+			Ok(decoded) => decoded,
+			Err(e) => {
+				return self.format_error_response(format!("Heic Error:{:?}", e), "HeicError")
+			}
+		};
+		match image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data) {
+			Some(img) => self.response_img(DynamicImage::ImageRgba8(img)),
+			None => self.format_error_response("HeicBufferMismatch".to_owned(), "HeicError"),
+		}
+	}
+	/// PDFの1ページ目のみ描画
+	fn encode_pdf(&mut self) -> axum::response::Response {
+		let bytes = std::mem::take(&mut self.src_bytes);
+		let pdf = match hayro::hayro_syntax::Pdf::new(bytes) {
+			Ok(pdf) => pdf,
+			Err(e) => return self.format_error_response(format!("Pdf Error:{:?}", e), "PdfError"),
+		};
+		let pages = pdf.pages();
+		let Some(page) = pages.iter().next() else {
+			return self.format_error_response("PdfNoPages".to_owned(), "PdfError");
+		};
+		let (w, h) = page.render_dimensions();
+		if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+			return self.format_error_response(format!("PdfDimensions {}x{}", w, h), "PdfError");
+		}
+		// 縮小時の品質確保のため2倍で描画し、予算超過なら等倍へ
+		// as u64は飽和キャストなので巨大値でも安全
+		let mut scale = 2.0f32;
+		if !self.dimensions_allowed((w * scale) as u64, (h * scale) as u64) {
+			scale = 1.0;
+		}
+		if !self.dimensions_allowed((w * scale) as u64, (h * scale) as u64) {
+			return self.decode_limit_response(format!("DecodeDimensions {}x{} over limit", w, h));
+		}
+		let cache = hayro::RenderCache::new();
+		let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
+		let render_settings = hayro::RenderSettings {
+			x_scale: scale,
+			y_scale: scale,
+			// 透過背景では暗色テーマで文書が読めないため白背景
+			bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+			..Default::default()
+		};
+		let pixmap = hayro::render(page, &cache, &interpreter_settings, &render_settings);
+		let width = pixmap.width() as u32;
+		let height = pixmap.height() as u32;
+		let mut buf = Vec::with_capacity(width as usize * height as usize * 4);
+		for p in pixmap.take_unpremultiplied() {
+			buf.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+		}
+		match image::RgbaImage::from_raw(width, height, buf) {
+			Some(img) => self.response_img(DynamicImage::ImageRgba8(img)),
+			None => self.format_error_response("PdfBufferMismatch".to_owned(), "PdfError"),
+		}
+	}
+	fn encode_vips(&mut self) -> axum::response::Response {
+		// ピクセル確保前のヘッダのみによるゲート(finding #4)
+		let header = match crate::vips::parse_header(&self.src_bytes) {
+			Ok(header) => header,
+			Err(e) => return self.format_error_response(format!("Vips {}", e), "VipsError"),
+		};
+		if !self.dimensions_allowed(header.width as u64, header.height as u64) {
+			return self.decode_limit_response(format!(
+				"DecodeDimensions {}x{} over limit",
+				header.width, header.height
+			));
+		}
+		match crate::vips::decode(&self.src_bytes, &header) {
+			Ok(img) => self.response_img(img),
+			Err(e) => self.format_error_response(format!("Vips {}", e), "VipsError"),
+		}
+	}
+	/// アニメはAPNG/GIF等と同じくアニメWebPへ再エンコード
+	fn encode_mng(&mut self) -> axum::response::Response {
+		let first_frame_only = self.parms.r#static.is_some() || self.parms.badge.is_some();
+		let anim = match crate::mng::decode(
+			&self.src_bytes,
+			self.max_decode_pixels(),
+			ANIMATION_FRAMES_LIMIT,
+			first_frame_only,
+		) {
+			Ok(anim) => anim,
+			Err(e) => return self.format_error_response(format!("MngAnim {}", e), "MngError"),
+		};
+		if first_frame_only || anim.frames.len() == 1 {
+			if let Some(frame) = anim.frames.into_iter().next() {
+				return self.response_img(DynamicImage::ImageRgba8(frame.into_buffer()));
+			}
+			return self.format_error_response("NoAvailableFrames".to_owned(), "MngError");
+		}
+		let loop_count = anim.loop_count;
+		let frames = image::Frames::new(Box::new(anim.frames.into_iter().map(Ok)));
+		self.encode_anim(frames, loop_count)
+	}
 	fn encode_anim(&self, frames: image::Frames, loop_count: u32) -> axum::response::Response {
 		let conf = webp::WebPConfig::new().unwrap();
 		let mut size: Option<(u32, u32)> = None;
@@ -985,6 +1130,14 @@ fn jpegxr_img(
 		}
 		_ => None,
 	}
+}
+
+/// 外部由来バイトを含むエラーの`X-Proxy-Error`値を生成
+///
+/// ヘッダ不正文字を含む場合があり、unwrapしてはならない(finding #3)
+fn error_header_value(msg: String, fallback: &'static str) -> reqwest::header::HeaderValue {
+	reqwest::header::HeaderValue::from_bytes(msg.as_bytes())
+		.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(fallback))
 }
 
 /// jxl-oxideのエラーから `X-Proxy-Error` 値を組み立てる。

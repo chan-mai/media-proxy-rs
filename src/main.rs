@@ -8,8 +8,10 @@ use tokio_stream::StreamExt;
 mod browsersafe;
 mod image_test;
 mod img;
+mod mng;
 mod ssrf;
 mod svg;
+mod vips;
 
 /// Bounds concurrent fetch+encode work so that per-request memory budgets
 /// (#4/#5) cannot be multiplied without limit (finding #6). Auth and
@@ -608,6 +610,7 @@ impl RequestContext {
 							"image/x-targa" | "image/x-tga" => {
 								self.codec = Ok(image::ImageFormat::Tga)
 							}
+							"application/pdf" => is_img = true,
 							_ => {}
 						}
 					}
@@ -634,6 +637,39 @@ impl RequestContext {
 						self.headers.remove("Content-Type");
 						self.headers
 							.append("Content-Type", "image/jxr".parse().unwrap());
+					}
+					// ISO BMFF ftypのHEIC/HEIF系ブランド
+					if head.len() >= 12
+						&& &head[4..8] == b"ftyp"
+						&& matches!(
+							&head[8..12],
+							b"heic"
+								| b"heix" | b"heim" | b"heis"
+								| b"hevc" | b"hevx" | b"hevm"
+								| b"hevs" | b"mif1" | b"msf1"
+						) {
+						is_img = true;
+						self.headers.remove("Content-Type");
+						self.headers
+							.append("Content-Type", "image/heic".parse().unwrap());
+					}
+					if head.starts_with(b"%PDF-") {
+						is_img = true;
+						self.headers.remove("Content-Type");
+						self.headers
+							.append("Content-Type", "application/pdf".parse().unwrap());
+					}
+					if crate::vips::is_vips(head) {
+						is_img = true;
+						self.headers.remove("Content-Type");
+						self.headers
+							.append("Content-Type", "image/x-vips".parse().unwrap());
+					}
+					if head.starts_with(&crate::mng::SIGNATURE) {
+						is_img = true;
+						self.headers.remove("Content-Type");
+						self.headers
+							.append("Content-Type", "image/x-mng".parse().unwrap());
 					}
 				}
 			}

@@ -79,3 +79,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - JPEG XL(jxl-oxide)
 - JPEG 2000(openjp2)
 - JPEG XR(jxrlib)
+- HEIC/HEIF(heic-rs)
+- PDF(hayro, 1ページ目のみ)
+- MNG
+- VIPS(uchar/ushort, coding none)
