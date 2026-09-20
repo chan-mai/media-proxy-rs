@@ -575,6 +575,11 @@ impl RequestContext {
 					self.encode_single()
 				}
 			}
+			#[cfg(feature = "avif-decoder")]
+			image::ImageFormat::Avif => {
+				// avifブランドでもシーケンストラックがあればアニメとして処理
+				self.encode_avif_seq()
+			}
 			_ => self.encode_single(),
 		}
 	}
@@ -726,6 +731,8 @@ impl RequestContext {
 			"application/pdf" => Some(self.encode_pdf()),
 			"image/x-vips" => Some(self.encode_vips()),
 			"image/x-mng" => Some(self.encode_mng()),
+			#[cfg(feature = "avif-decoder")]
+			"image/avif" => Some(self.encode_avif_seq()),
 			_ => None,
 		}
 	}
@@ -829,6 +836,50 @@ impl RequestContext {
 			Ok(img) => self.response_img(img),
 			Err(e) => self.format_error_response(format!("Vips {}", e), "VipsError"),
 		}
+	}
+	/// AVIFシーケンスをアニメWebPへ再エンコード
+	/// シーケンス無しはprimary itemの静止画としてデコード
+	#[cfg(feature = "avif-decoder")]
+	fn encode_avif_seq(&mut self) -> axum::response::Response {
+		let first_frame_only = self.parms.r#static.is_some() || self.parms.badge.is_some();
+		let seq = match crate::avif_seq::decode(
+			&self.src_bytes,
+			self.max_decode_pixels(),
+			ANIMATION_FRAMES_LIMIT,
+			first_frame_only,
+		) {
+			Ok(Some(seq)) => seq,
+			Ok(None) => {
+				return match image::load_from_memory_with_format(
+					&self.src_bytes,
+					image::ImageFormat::Avif,
+				) {
+					Ok(img) => self.response_img(img),
+					Err(e) => {
+						self.format_error_response(format!("DecodeError_{:?}", e), "AvifError")
+					}
+				};
+			}
+			Err(e) => return self.format_error_response(format!("AvifSeq {}", e), "AvifError"),
+		};
+		if first_frame_only || seq.frames.len() == 1 {
+			let Some(frame) = seq.frames.into_iter().next() else {
+				return self.format_error_response("NoAvailableFrames".to_owned(), "AvifError");
+			};
+			return self.response_img(DynamicImage::ImageRgba8(frame.image));
+		}
+		let collected: Vec<Result<image::Frame, image::ImageError>> = seq
+			.frames
+			.into_iter()
+			.map(|frame| {
+				let delay = image::Delay::from_saturating_duration(
+					std::time::Duration::from_millis(frame.duration_ms),
+				);
+				Ok(image::Frame::from_parts(frame.image, 0, 0, delay))
+			})
+			.collect();
+		let frames = image::Frames::new(Box::new(collected.into_iter()));
+		self.encode_anim(frames, 0)
 	}
 	/// アニメはAPNG/GIF等と同じくアニメWebPへ再エンコード
 	fn encode_mng(&mut self) -> axum::response::Response {
