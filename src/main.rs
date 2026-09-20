@@ -119,7 +119,7 @@ fn main() {
 		let default_config=ConfigFile{
 			bind_addr: "0.0.0.0:12766".to_owned(),
 			timeout:10000,
-			user_agent: "https://github.com/yojo-art/media-proxy-rs".to_owned(),
+			user_agent: "https://github.com/chan-mai/media-proxy-rs".to_owned(),
 			max_size:256*1024*1024,
 			proxy:None,
 			filter_type:FilterType::Triangle,

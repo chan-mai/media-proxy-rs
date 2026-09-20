@@ -1,7 +1,7 @@
 {
   "bind_addr": "0.0.0.0:12766",
   "timeout": 10000,
-  "user_agent": "https://github.com/yojo-art/media-proxy-rs",
+  "user_agent": "https://github.com/chan-mai/media-proxy-rs",
   "max_size": 268435456,
   "proxy": null,
   "filter_type": "Triangle",
